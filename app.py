@@ -11,6 +11,7 @@ st.set_page_config(page_title="Fusión - GPS Técnico", page_icon="📍", layout
 
 SHEET_ID = "13R_3Mdr25Jd-nGhK7CxdcbKkFWLc0LPdYrOLOY8sZJo"
 WORKSHEET_CLIENTES = "Clientes"
+WORKSHEET_CAJAS = "Cajas"
 
 def ahora_argentina():
     tz = pytz.timezone('America/Argentina/Cordoba')
@@ -30,11 +31,14 @@ def init_connection():
 def load_data():
     doc = init_connection()
     ws_clientes = doc.worksheet(WORKSHEET_CLIENTES)
+    ws_cajas = doc.worksheet(WORKSHEET_CAJAS)
+    
     df_clientes = pd.DataFrame(ws_clientes.get_all_records(default_blank=""))
-    return ws_clientes, df_clientes
+    df_cajas = pd.DataFrame(ws_cajas.get_all_records(default_blank=""))
+    return ws_clientes, df_clientes, df_cajas
 
 try:
-    ws_clientes, df_clientes = load_data()
+    ws_clientes, df_clientes, df_cajas = load_data()
 except Exception as e:
     st.error("Error de conexión. Contactá a oficina.")
     st.stop()
@@ -66,8 +70,10 @@ if busqueda:
         # gspread usa índice base 1, +1 por el header = +2
         row_idx = cliente_row.name + 2 
         
+        caja_actual = str(cliente_row.get("Caja NAP", "")).replace("nan", "")
+        
         st.info(f"**Dirección:** {cliente_row.get('Dirección', 'S/D')} \n\n"
-                f"**Precinto actual:** {cliente_row.get('N° de Precinto', 'Ninguno')}")
+                f"**Caja actual:** {caja_actual if caja_actual else 'Ninguna'} | **Precinto:** {cliente_row.get('N° de Precinto', 'Ninguno')}")
         
         st.markdown("### 1. Capturar Satélite")
         loc = streamlit_geolocation()
@@ -82,10 +88,14 @@ if busqueda:
         with st.form("form_cliente"):
             st.markdown("### 2. Datos Complementarios (Opcional)")
             
+            cajas_validas = [""] + sorted([str(c).strip() for c in df_cajas["N De Caja"].dropna().unique() if str(c).strip()])
+            caja_idx = cajas_validas.index(caja_actual) if caja_actual in cajas_validas else 0
+            
             precinto_actual = str(cliente_row.get("N° de Precinto", "")).replace("nan", "")
             nuevo_precinto = st.text_input("🔒 Precinto (Solo 7 números)", value=precinto_actual)
+            nueva_caja = st.selectbox("📦 Caja NAP", options=cajas_validas, index=caja_idx)
             
-            submit = st.form_submit_button("💾 Guardar Ubicación", use_container_width=True)
+            submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
             
             if submit:
                 if not loc or 'latitude' not in loc or loc['latitude'] is None:
@@ -100,6 +110,8 @@ if busqueda:
                     ]
                     if nuevo_precinto != precinto_actual:
                         updates.append({"range": f"F{row_idx}", "values": [[nuevo_precinto]]})
+                    if nueva_caja != caja_actual:
+                        updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
                         
                     ws_clientes.batch_update(updates)
                     st.cache_data.clear()
