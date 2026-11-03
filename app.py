@@ -1,186 +1,430 @@
-import streamlit as st
-import pandas as pd
-from google.oauth2 import service_account
-import gspread
-from streamlit_geolocation import streamlit_geolocation
-from datetime import datetime
-import pytz
+import inspect
+import threading
 import time
+import unicodedata
+from datetime import datetime
 
-# --- CONFIGURACIÓN ---
+import gspread
+import pandas as pd
+import pytz
+import streamlit as st
+from google.oauth2 import service_account
+from streamlit_geolocation import streamlit_geolocation
+
+# =====================================================================
+# CONFIGURACIÓN
+# =====================================================================
 st.set_page_config(page_title="Fusión - GPS Técnico", page_icon="📍", layout="centered")
 
 SHEET_ID = "13R_3Mdr25Jd-nGhK7CxdcbKkFWLc0LPdYrOLOY8sZJo"
 WORKSHEET_CLIENTES = "Clientes"
 WORKSHEET_CAJAS = "Cajas"
 
+# Columnas de la hoja "Clientes" donde se escribe
+COL_PRECINTO = "F"
+COL_FECHA = "H"
+COL_LAT = "J"
+COL_LON = "K"
+COL_CAJA = "M"
+
+# Nombres de encabezados
+H_NUM = "Nº Cliente"
+H_NOMBRE = "Nombre"
+H_DIR = "Dirección"
+H_CAJA = "Caja NAP"
+H_PRECINTO = "N° de Precinto"
+H_LAT = "Latitud"
+H_LON = "Longitud"
+H_CAJAS_NUM = "N De Caja"
+
+TTL_DATOS = 600          # segundos antes de refrescar desde Google Sheets
+MIN_CHARS = 3            # mínimo de caracteres para buscar
+MAX_RESULTADOS = 30      # máximo de resultados en el selector
+TIMEOUT_API = (6, 30)    # (conexión, lectura) en segundos
+
+
 def ahora_argentina():
-    tz = pytz.timezone('America/Argentina/Cordoba')
+    tz = pytz.timezone("America/Argentina/Cordoba")
     return datetime.now(tz).strftime("%d/%m/%Y %H:%M:%S")
 
-# --- CONEXIÓN A SHEETS ---
+
+def normalizar(texto):
+    """Minúsculas, sin acentos, sin espacios repetidos."""
+    t = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode()
+    return " ".join(t.lower().split())
+
+
+# =====================================================================
+# CONEXIÓN A GOOGLE SHEETS (se crea UNA sola vez por servidor)
+# =====================================================================
 @st.cache_resource(show_spinner="Conectando a Fusión...")
-def get_sheet_client():
+def get_doc():
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
         creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
-    return gspread.authorize(creds)
+    client = gspread.authorize(creds)
+    # Evita que la app quede colgada "cargando" si se corta la red
+    try:
+        client.set_timeout(TIMEOUT_API)
+    except Exception:
+        pass
+    return client.open_by_key(SHEET_ID)
 
-# OPTIMIZACIÓN 1: Subimos el TTL a 600 (10 minutos)
-@st.cache_data(ttl=600, show_spinner="Actualizando base (optimizado)...")
-def load_data():
-    client = get_sheet_client()
-    doc = client.open_by_key(SHEET_ID)
-    
-    # OPTIMIZACIÓN 2: Usar get_all_values() en lugar de get_all_records()
-    ws_clientes = doc.worksheet(WORKSHEET_CLIENTES)
-    data_clientes = ws_clientes.get_all_values()
-    # Convertimos la lista cruda en un DataFrame usando la primera fila como columnas
-    df_clientes = pd.DataFrame(data_clientes[1:], columns=data_clientes[0])
-    
-    ws_cajas = doc.worksheet(WORKSHEET_CAJAS)
-    data_cajas = ws_cajas.get_all_values()
-    df_cajas = pd.DataFrame(data_cajas[1:], columns=data_cajas[0])
-    
-    return df_clientes, df_cajas
 
+@st.cache_resource(show_spinner=False)
+def get_ws_clientes():
+    return get_doc().worksheet(WORKSHEET_CLIENTES)
+
+
+# =====================================================================
+# DATOS: una sola llamada a la API, compartida entre todos los usuarios
+# =====================================================================
+@st.cache_resource(show_spinner=False)
+def get_store():
+    return {
+        "lock": threading.RLock(),
+        "ts": 0.0,
+        "clientes": None,
+        "cajas": [],
+        "headers": [],
+    }
+
+
+def _a_df(values):
+    if not values:
+        return pd.DataFrame()
+    headers = [str(h).strip() for h in values[0]]
+    n = len(headers)
+    filas = [(list(r) + [""] * (n - len(r)))[:n] for r in values[1:]]
+    return pd.DataFrame(filas, columns=headers)
+
+
+def _fetch():
+    doc = get_doc()
+    resp = None
+    for intento in range(3):
+        try:
+            resp = doc.values_batch_get([WORKSHEET_CLIENTES, WORKSHEET_CAJAS])
+            break
+        except Exception:
+            if intento == 2:
+                raise
+            time.sleep(1 + intento)
+
+    rangos = resp.get("valueRanges", [])
+    df_clientes = _a_df(rangos[0].get("values", []) if len(rangos) > 0 else [])
+    df_cajas = _a_df(rangos[1].get("values", []) if len(rangos) > 1 else [])
+
+    for col in (H_NUM, H_NOMBRE):
+        if col not in df_clientes.columns:
+            raise ValueError(f"No encontré la columna '{col}' en la hoja {WORKSHEET_CLIENTES}.")
+
+    # Columna precalculada para buscar rápido (sin acentos ni mayúsculas)
+    df_clientes["_buscar"] = (
+        (df_clientes[H_NUM].astype(str) + " " + df_clientes[H_NOMBRE].astype(str))
+        .map(normalizar)
+    )
+
+    cajas = []
+    if H_CAJAS_NUM in df_cajas.columns:
+        cajas = sorted({str(c).strip() for c in df_cajas[H_CAJAS_NUM] if str(c).strip()})
+
+    return df_clientes, cajas, list(df_clientes.columns)
+
+
+def get_data(force=False):
+    """Devuelve (df_clientes, cajas, headers, aviso). Refresca solo si venció el TTL."""
+    s = get_store()
+    with s["lock"]:
+        vencido = (time.time() - s["ts"]) > TTL_DATOS
+        if force or vencido or s["clientes"] is None:
+            try:
+                df, cajas, headers = _fetch()
+                s["clientes"], s["cajas"], s["headers"] = df, cajas, headers
+                s["ts"] = time.time()
+            except Exception as e:
+                if s["clientes"] is None:
+                    raise
+                # Hay datos viejos: seguimos con ellos y reintentamos en 1 minuto
+                s["ts"] = time.time() - TTL_DATOS + 60
+                return s["clientes"], s["cajas"], s["headers"], f"No pude actualizar la base ({str(e)[:60]}). Uso datos anteriores."
+        return s["clientes"], s["cajas"], s["headers"], None
+
+
+def parchear_fila(row_pos, cambios):
+    """Actualiza en memoria la fila guardada, para no recargar toda la hoja."""
+    s = get_store()
+    with s["lock"]:
+        df = s["clientes"]
+        if df is None or row_pos not in df.index:
+            return
+        for col, val in cambios.items():
+            if col in df.columns:
+                df.at[row_pos, col] = val
+
+
+# =====================================================================
+# GPS: cada cliente tiene su propio componente (evita coords viejas)
+# =====================================================================
 try:
-    df_clientes, df_cajas = load_data()
-    client = get_sheet_client()
-    ws_clientes = client.open_by_key(SHEET_ID).worksheet(WORKSHEET_CLIENTES)
+    GEO_ACEPTA_KEY = "key" in inspect.signature(streamlit_geolocation).parameters
+except Exception:
+    GEO_ACEPTA_KEY = False
+
+
+def loc_valida(loc):
+    return bool(loc) and isinstance(loc, dict) and loc.get("latitude") is not None and loc.get("longitude") is not None
+
+
+def widget_gps(id_cliente):
+    nonce = st.session_state.get("geo_nonce", 0)
+    if GEO_ACEPTA_KEY:
+        return streamlit_geolocation(key=f"geo_{id_cliente}_{nonce}")
+    # Versión de la librería sin "key": forzamos un remontaje al cambiar de cliente
+    marca = f"{id_cliente}_{nonce}"
+    if st.session_state.get("geo_marca") != marca:
+        st.session_state.geo_marca = marca
+        st.info("🔄 Preparando GPS para el nuevo cliente...")
+        st.rerun()
+    return streamlit_geolocation()
+
+
+# =====================================================================
+# GUARDADO
+# =====================================================================
+def localizar_fila(ws, headers, numero, fila_esperada):
+    """Confirma que la fila de la hoja sigue siendo del cliente (por si alguien reordenó)."""
+    col_num = headers.index(H_NUM) + 1
+    try:
+        valor = ws.cell(fila_esperada, col_num).value
+        if str(valor or "").strip() == str(numero).strip():
+            return fila_esperada
+    except Exception:
+        pass
+    valores = ws.col_values(col_num)
+    for i, v in enumerate(valores, start=1):
+        if i > 1 and str(v).strip() == str(numero).strip():
+            return i
+    return None
+
+
+def guardar(row_pos, numero, loc, nuevo_precinto, precinto_actual, nueva_caja, caja_actual, headers):
+    ws = get_ws_clientes()
+    fila_esperada = row_pos + 2
+    fila = None
+
+    for intento in range(3):
+        try:
+            if fila is None:
+                fila = localizar_fila(ws, headers, numero, fila_esperada)
+                if fila is None:
+                    return False, "No encontré al cliente en la planilla. Recargá los datos e intentá de nuevo."
+
+            fecha = ahora_argentina()
+            updates = [
+                {"range": f"{COL_LAT}{fila}", "values": [[str(loc["latitude"])]]},
+                {"range": f"{COL_LON}{fila}", "values": [[str(loc["longitude"])]]},
+                {"range": f"{COL_FECHA}{fila}", "values": [[fecha]]},
+            ]
+            if nuevo_precinto != precinto_actual:
+                # El apóstrofe fuerza texto y conserva ceros iniciales
+                valor_prec = f"'{nuevo_precinto}" if nuevo_precinto.startswith("0") else nuevo_precinto
+                updates.append({"range": f"{COL_PRECINTO}{fila}", "values": [[valor_prec]]})
+            if nueva_caja != caja_actual:
+                updates.append({"range": f"{COL_CAJA}{fila}", "values": [[nueva_caja]]})
+
+            ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+            if fila == fila_esperada:
+                cambios = {H_LAT: str(loc["latitude"]), H_LON: str(loc["longitude"])}
+                if nuevo_precinto != precinto_actual:
+                    cambios[H_PRECINTO] = nuevo_precinto
+                if nueva_caja != caja_actual:
+                    cambios[H_CAJA] = nueva_caja
+                parchear_fila(row_pos, cambios)
+            else:
+                get_store()["ts"] = 0.0  # la hoja cambió de orden: forzar recarga
+            return True, None
+
+        except Exception as e:
+            if intento < 2:
+                get_ws_clientes.clear()
+                time.sleep(1 + intento)
+                try:
+                    ws = get_ws_clientes()
+                except Exception:
+                    pass
+            else:
+                return False, f"Error de red al guardar: {str(e)[:80]}. Intentá nuevamente."
+    return False, "No se pudo guardar."
+
+
+# =====================================================================
+# PANEL DEL CLIENTE
+# =====================================================================
+def panel_cliente(row_pos, df_clientes, cajas, headers):
+    row = df_clientes.loc[row_pos]
+    numero = str(row.get(H_NUM, "")).strip()
+    id_cliente = f"{row_pos}_{numero}"
+
+    caja_actual = str(row.get(H_CAJA, "")).strip()
+    precinto_actual = str(row.get(H_PRECINTO, "")).strip()
+
+    st.info(
+        f"**Dirección:** {row.get(H_DIR, 'S/D')}  \n\n"
+        f"**Caja actual:** {caja_actual or 'Ninguna'} | **Precinto:** {precinto_actual or 'Ninguno'}"
+    )
+
+    lat_actual = str(row.get(H_LAT, "")).strip()
+    lon_actual = str(row.get(H_LON, "")).strip()
+    if lat_actual and lon_actual and lat_actual.lower() not in ("nan", "none") and lon_actual.lower() not in ("nan", "none"):
+        st.warning(
+            f"⚠️ **Atención:** Este cliente ya tiene una ubicación guardada ({lat_actual}, {lon_actual}). "
+            "Si guardás ahora, la ubicación anterior será reemplazada."
+        )
+        st.markdown(f"🗺️ **[Ver ubicación actual en Google Maps](https://www.google.com/maps?q={lat_actual},{lon_actual})**")
+
+    st.markdown("### 1. 📡 OBTENER UBICACIÓN")
+    st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
+
+    loc = widget_gps(id_cliente)
+
+    if loc_valida(loc):
+        precision = loc.get("accuracy")
+        txt = f"📍 ¡Ubicación capturada lista para guardar!\n\nLat: {loc['latitude']} | Lon: {loc['longitude']}"
+        if precision is not None:
+            try:
+                txt += f"\n\nPrecisión: ±{float(precision):.0f} m"
+            except (TypeError, ValueError):
+                pass
+        st.success(txt)
+        try:
+            if precision is not None and float(precision) > 100:
+                st.warning("⚠️ La precisión del GPS es baja. Si podés, esperá unos segundos y volvé a presionar el botón.")
+        except (TypeError, ValueError):
+            pass
+    else:
+        st.error("❌ Esperando captura de GPS... Tocá el botón de arriba.")
+
+    # Si la caja actual no está en la lista, la agregamos para no borrarla sin querer
+    opciones_caja = [""] + cajas
+    if caja_actual and caja_actual not in opciones_caja:
+        opciones_caja.append(caja_actual)
+    caja_idx = opciones_caja.index(caja_actual) if caja_actual in opciones_caja else 0
+
+    with st.form(key=f"form_{id_cliente}"):
+        st.markdown("### 2. Datos Complementarios (Opcional)")
+        nuevo_precinto = st.text_input(
+            "🔒 Precinto (Solo 7 números)",
+            value=precinto_actual,
+            max_chars=7,
+            key=f"prec_{id_cliente}",
+        ).strip()
+        nueva_caja = st.selectbox(
+            "📦 Caja NAP", options=opciones_caja, index=caja_idx, key=f"caja_{id_cliente}"
+        )
+        submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
+
+    if not submit:
+        return
+
+    # ---- Validaciones ----
+    if not loc_valida(loc):
+        st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
+        return
+    if nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
+        st.error("❌ El precinto debe tener exactamente 7 números.")
+        return
+    if nuevo_precinto and nuevo_precinto != precinto_actual and H_PRECINTO in df_clientes.columns:
+        coincide = df_clientes[H_PRECINTO].astype(str).str.strip() == nuevo_precinto
+        coincide &= df_clientes.index != row_pos
+        if coincide.any():
+            dup = df_clientes[coincide].iloc[0]
+            st.error(f"❌ El precinto {nuevo_precinto} ya lo tiene el cliente: {dup[H_NUM]} - {dup[H_NOMBRE]}.")
+            return
+
+    # ---- Guardado ----
+    with st.spinner("Guardando..."):
+        ok, error = guardar(
+            row_pos, numero, loc, nuevo_precinto, precinto_actual, nueva_caja, caja_actual, headers
+        )
+
+    if ok:
+        st.session_state["msg_ok"] = f"✅ Datos de {row.get(H_NOMBRE, 'cliente')} guardados correctamente."
+        st.session_state["reset_busqueda"] = True
+        st.session_state["geo_nonce"] = st.session_state.get("geo_nonce", 0) + 1
+        st.rerun()
+    else:
+        st.error(f"❌ {error}")
+
+
+# =====================================================================
+# INTERFAZ
+# =====================================================================
+try:
+    df_clientes, cajas, headers, aviso = get_data()
 except Exception as e:
-    st.error(f"Error de conexión. Contactá a oficina. Detalle: {e}")
+    st.error(f"Error de conexión. Contactá a oficina. Detalle: {str(e)[:200]}")
+    if st.button("🔄 Reintentar"):
+        st.rerun()
     st.stop()
 
-# --- INTERFAZ MÓVIL ---
 st.title("📍 Fusión Campo")
 st.markdown("Captura de coordenadas de Clientes")
 st.markdown("---")
 
-# Inicializamos el estado para la búsqueda si no existe
-if "busqueda_cliente" not in st.session_state:
-    st.session_state.busqueda_cliente = ""
+if aviso:
+    st.warning(aviso)
 
-# ==========================================
-# GESTIÓN DE CLIENTES
-# ==========================================
+# El reseteo se hace ANTES de crear el widget (si no, Streamlit da error)
+if st.session_state.pop("reset_busqueda", False):
+    st.session_state["busqueda_cliente"] = ""
+
+mensaje_ok = st.session_state.pop("msg_ok", None)
+if mensaje_ok:
+    st.success(mensaje_ok)
+
 busqueda = st.text_input(
-    "🔍 Buscar Cliente (Nombre o Nº)", 
-    placeholder="Ej: Juan Perez o 9944", 
-    key="busqueda_cliente"
-).strip().upper()
+    "🔍 Buscar Cliente (Nombre o Nº)",
+    placeholder="Ej: Juan Perez o 9944",
+    key="busqueda_cliente",
+).strip()
 
 if busqueda:
-    mask = df_clientes["Nº Cliente"].astype(str).str.contains(busqueda, case=False) | \
-           df_clientes["Nombre"].astype(str).str.contains(busqueda, case=False)
-    resultados = df_clientes[mask]
-    
-    if resultados.empty:
-        st.warning("No se encontraron clientes.")
+    q = normalizar(busqueda)
+    if len(q) < MIN_CHARS:
+        st.caption(f"Escribí al menos {MIN_CHARS} caracteres para buscar.")
     else:
-        opciones = resultados.apply(lambda x: f"{x['Nº Cliente']} - {x['Nombre']}", axis=1).tolist()
-        cliente_sel = st.selectbox("Seleccioná el cliente correcto:", opciones)
-        
-        idx_sel = opciones.index(cliente_sel)
-        cliente_row = resultados.iloc[idx_sel]
-        
-        # ID para controlar el reseteo
-        id_cliente = str(cliente_row.get('Nº Cliente', idx_sel))
-        row_idx = cliente_row.name + 2 
-        
-        caja_actual = str(cliente_row.get("Caja NAP", "")).replace("nan", "")
-        
-        st.info(f"**Dirección:** {cliente_row.get('Dirección', 'S/D')} \n\n"
-                f"**Caja actual:** {caja_actual if caja_actual else 'Ninguna'} | **Precinto:** {cliente_row.get('N° de Precinto', 'Ninguno')}")
-        
-        lat_actual = str(cliente_row.get("Latitud", "")).strip()
-        lon_actual = str(cliente_row.get("Longitud", "")).strip()
-        
-        if lat_actual and lon_actual and lat_actual not in ["nan", "None", ""] and lon_actual not in ["nan", "None", ""]:
-            st.warning(f"⚠️ **Atención:** Este cliente ya tiene una ubicación guardada ({lat_actual}, {lon_actual}). Si guardás ahora, la ubicación anterior será reemplazada.")
-            st.markdown(f"🗺️ **[Ver ubicación actual en Google Maps](https://www.google.com/maps?q={lat_actual},{lon_actual})**")
-        
-        if "ultimo_cliente" not in st.session_state:
-            st.session_state.ultimo_cliente = id_cliente
-            st.session_state.refresh_gps = False
+        resultados = df_clientes[df_clientes["_buscar"].str.contains(q, regex=False)]
+        total = len(resultados)
 
-        if st.session_state.ultimo_cliente != id_cliente:
-            st.session_state.ultimo_cliente = id_cliente
-            st.session_state.refresh_gps = True
-            st.rerun()
-
-        if st.session_state.refresh_gps:
-            st.session_state.refresh_gps = False
-            st.info("🔄 Preparando satélite para el nuevo cliente...")
-            st.rerun()
+        if total == 0:
+            st.warning("No se encontraron clientes.")
         else:
-            st.markdown("### 1. 📡 OBTENER UBICACIÓN")
-            st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
-            
-            loc = streamlit_geolocation() 
-            
-            if loc and 'latitude' in loc and loc['latitude'] is not None:
-                st.success(f"📍 ¡Ubicación capturada lista para guardar!\n\nLat: {loc['latitude']} | Lon: {loc['longitude']}")
-            else:
-                st.error("❌ Esperando captura de GPS... Toca el botón de arriba.")
-            
-            with st.form(key=f"form_{id_cliente}"):
-                st.markdown("### 2. Datos Complementarios (Opcional)")
-                
-                cajas_validas = [""] + sorted([str(c).strip() for c in df_cajas["N De Caja"].dropna().unique() if str(c).strip()])
-                caja_idx = cajas_validas.index(caja_actual) if caja_actual in cajas_validas else 0
-                
-                precinto_actual = str(cliente_row.get("N° de Precinto", "")).replace("nan", "")
-                nuevo_precinto = st.text_input("🔒 Precinto (Solo 7 números)", value=precinto_actual)
-                nueva_caja = st.selectbox("📦 Caja NAP", options=cajas_validas, index=caja_idx)
-                
-                submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
-                
-                if submit:
-                    duplicado = False
-                    if nuevo_precinto and nuevo_precinto != precinto_actual and len(nuevo_precinto) == 7:
-                        duplicados_df = df_clientes[df_clientes["N° de Precinto"].astype(str).str.strip() == nuevo_precinto]
-                        if not duplicados_df.empty:
-                            cliente_dup = duplicados_df.iloc[0]
-                            st.error(f"❌ El precinto {nuevo_precinto} ya lo tiene el cliente: {cliente_dup['Nº Cliente']} - {cliente_dup['Nombre']}.")
-                            duplicado = True
+            if total > MAX_RESULTADOS:
+                st.caption(f"Mostrando {MAX_RESULTADOS} de {total} resultados. Escribí más para afinar la búsqueda.")
+                resultados = resultados.head(MAX_RESULTADOS)
 
-                    if not loc or 'latitude' not in loc or loc['latitude'] is None:
-                        st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
-                    elif nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
-                        st.error("❌ El precinto debe tener exactamente 7 números.")
-                    elif not duplicado:
-                        updates = [
-                            {"range": f"J{row_idx}", "values": [[str(loc['latitude'])]]},
-                            {"range": f"K{row_idx}", "values": [[str(loc['longitude'])]]},
-                            {"range": f"H{row_idx}", "values": [[ahora_argentina()]]}
-                        ]
-                        if nuevo_precinto != precinto_actual:
-                            updates.append({"range": f"F{row_idx}", "values": [[nuevo_precinto]]})
-                        if nueva_caja != caja_actual:
-                            updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
-                            
-                        guardado_exitoso = False
-                        max_intentos = 3
-                        
-                        for intento in range(max_intentos):
-                            try:
-                                ws_clientes.batch_update(updates, value_input_option='USER_ENTERED')
-                                guardado_exitoso = True
-                                break
-                            except Exception as e:
-                                if intento < max_intentos - 1:
-                                    time.sleep(2)
-                                else:
-                                    st.error(f"❌ Error de red al guardar: {str(e)[:50]}... Intentá nuevamente.")
-                        
-                        if guardado_exitoso:
-                            st.cache_data.clear()
-                            st.success("✅ Datos guardados correctamente. Actualizando pantalla...")
-                            
-                            time.sleep(1.5)
-                            st.session_state.busqueda_cliente = ""
-                            st.session_state.ultimo_cliente = None
-                            st.rerun()
+            etiquetas = dict(
+                zip(resultados.index, resultados[H_NUM].astype(str) + " - " + resultados[H_NOMBRE].astype(str))
+            )
+            row_pos = st.selectbox(
+                "Seleccioná el cliente correcto:",
+                options=list(etiquetas.keys()),
+                format_func=lambda i: etiquetas.get(i, str(i)),
+            )
+            panel_cliente(row_pos, df_clientes, cajas, headers)
+
+st.markdown("---")
+if st.button("🔄 Recargar datos de la planilla"):
+    with st.spinner("Actualizando..."):
+        try:
+            get_data(force=True)
+        except Exception as e:
+            st.error(f"No pude actualizar: {str(e)[:100]}")
+    st.rerun()
