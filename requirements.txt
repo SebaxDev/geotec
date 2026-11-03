@@ -1,6 +1,6 @@
-streamlit>=1.30.0
-pandas>=2.0.0
-gspread>=5.12.0
-google-auth>=2.20.0
-pytz>=2023.3
-streamlit-geolocation>=0.0.10
+streamlit==1.66.1
+pandas==2.3.3
+gspread==6.2.1
+google-auth==2.62.1
+pytz==2026.6
+streamlit-geolocation==0.0.10

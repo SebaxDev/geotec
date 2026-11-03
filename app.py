@@ -1,4 +1,3 @@
-import inspect
 import threading
 import time
 import unicodedata
@@ -171,10 +170,16 @@ def parchear_fila(row_pos, cambios):
 # =====================================================================
 # GPS: cada cliente tiene su propio componente (evita coords viejas)
 # =====================================================================
+# La librería fija internamente key="loc", por eso llamamos al componente
+# interno con una clave propia por cliente: así se reinicia solo, sin reruns extra.
+GEO_DEFAULT = {
+    "latitude": None, "longitude": None, "altitude": None, "accuracy": None,
+    "altitudeAccuracy": None, "heading": None, "speed": None,
+}
 try:
-    GEO_ACEPTA_KEY = "key" in inspect.signature(streamlit_geolocation).parameters
+    from streamlit_geolocation import _streamlit_geolocation as _geo_component
 except Exception:
-    GEO_ACEPTA_KEY = False
+    _geo_component = None
 
 
 def loc_valida(loc):
@@ -183,9 +188,9 @@ def loc_valida(loc):
 
 def widget_gps(id_cliente):
     nonce = st.session_state.get("geo_nonce", 0)
-    if GEO_ACEPTA_KEY:
-        return streamlit_geolocation(key=f"geo_{id_cliente}_{nonce}")
-    # Versión de la librería sin "key": forzamos un remontaje al cambiar de cliente
+    if _geo_component is not None:
+        return _geo_component(key=f"geo_{id_cliente}_{nonce}", default=GEO_DEFAULT)
+    # Plan B (si la librería cambia): remontar el componente con un rerun
     marca = f"{id_cliente}_{nonce}"
     if st.session_state.get("geo_marca") != marca:
         st.session_state.geo_marca = marca
