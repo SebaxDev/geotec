@@ -5,6 +5,7 @@ import gspread
 from streamlit_geolocation import streamlit_geolocation
 from datetime import datetime
 import pytz
+import time
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Fusión - GPS Técnico", page_icon="📍", layout="centered")
@@ -48,10 +49,18 @@ st.title("📍 Fusión Campo")
 st.markdown("Captura de coordenadas de Clientes")
 st.markdown("---")
 
+# Inicializamos el estado para la búsqueda si no existe
+if "busqueda_cliente" not in st.session_state:
+    st.session_state.busqueda_cliente = ""
+
 # ==========================================
 # GESTIÓN DE CLIENTES
 # ==========================================
-busqueda = st.text_input("🔍 Buscar Cliente (Nombre o Nº)", placeholder="Ej: Juan Perez o 9944").strip().upper()
+busqueda = st.text_input(
+    "🔍 Buscar Cliente (Nombre o Nº)", 
+    placeholder="Ej: Juan Perez o 9944", 
+    key="busqueda_cliente"
+).strip().upper()
 
 if busqueda:
     mask = df_clientes["Nº Cliente"].astype(str).str.contains(busqueda, case=False) | \
@@ -76,12 +85,13 @@ if busqueda:
         st.info(f"**Dirección:** {cliente_row.get('Dirección', 'S/D')} \n\n"
                 f"**Caja actual:** {caja_actual if caja_actual else 'Ninguna'} | **Precinto:** {cliente_row.get('N° de Precinto', 'Ninguno')}")
         
-        # --- MEJORA 1: AVISO DE UBICACIÓN PREVIA ---
+        # --- MEJORA 1: AVISO DE UBICACIÓN PREVIA Y ENLACE A MAPS ---
         lat_actual = str(cliente_row.get("Latitud", "")).strip()
         lon_actual = str(cliente_row.get("Longitud", "")).strip()
         
         if lat_actual and lon_actual and lat_actual not in ["nan", "None", ""] and lon_actual not in ["nan", "None", ""]:
             st.warning(f"⚠️ **Atención:** Este cliente ya tiene una ubicación guardada ({lat_actual}, {lon_actual}). Si guardás ahora, la ubicación anterior será reemplazada.")
+            st.markdown(f"🗺️ **[Ver ubicación actual en Google Maps](https://www.google.com/maps?q={lat_actual},{lon_actual})**")
         
         # --- TRUCO DE REINICIO PARA EL BOTÓN GPS ---
         if "ultimo_cliente" not in st.session_state:
@@ -124,11 +134,20 @@ if busqueda:
                 submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
                 
                 if submit:
+                    # --- MEJORA 2: CONTROL DE PRECINTOS DUPLICADOS ---
+                    duplicado = False
+                    if nuevo_precinto and nuevo_precinto != precinto_actual and len(nuevo_precinto) == 7:
+                        duplicados_df = df_clientes[df_clientes["N° de Precinto"].astype(str).str.strip() == nuevo_precinto]
+                        if not duplicados_df.empty:
+                            cliente_dup = duplicados_df.iloc[0]
+                            st.error(f"❌ El precinto {nuevo_precinto} ya lo tiene el cliente: {cliente_dup['Nº Cliente']} - {cliente_dup['Nombre']}.")
+                            duplicado = True
+
                     if not loc or 'latitude' not in loc or loc['latitude'] is None:
                         st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
                     elif nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
                         st.error("❌ El precinto debe tener exactamente 7 números.")
-                    else:
+                    elif not duplicado:
                         updates = [
                             {"range": f"J{row_idx}", "values": [[str(loc['latitude'])]]},
                             {"range": f"K{row_idx}", "values": [[str(loc['longitude'])]]},
@@ -139,6 +158,27 @@ if busqueda:
                         if nueva_caja != caja_actual:
                             updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
                             
-                        ws_clientes.batch_update(updates, value_input_option='USER_ENTERED')
-                        st.cache_data.clear()
-                        st.success("✅ Datos guardados correctamente.")
+                        # --- MEJORA 3: TOLERANCIA A MICROCORTES (REINTENTOS) ---
+                        guardado_exitoso = False
+                        max_intentos = 3
+                        
+                        for intento in range(max_intentos):
+                            try:
+                                ws_clientes.batch_update(updates, value_input_option='USER_ENTERED')
+                                guardado_exitoso = True
+                                break
+                            except Exception as e:
+                                if intento < max_intentos - 1:
+                                    time.sleep(2)  # Espera 2 segundos si hay un microcorte 4G
+                                else:
+                                    st.error(f"❌ Error de red al guardar: {str(e)[:50]}... Intentá nuevamente.")
+                        
+                        if guardado_exitoso:
+                            st.cache_data.clear()
+                            st.success("✅ Datos guardados correctamente. Actualizando pantalla...")
+                            
+                            # --- MEJORA 4: REINICIO AUTOMÁTICO DE INTERFAZ ---
+                            time.sleep(1.5)
+                            st.session_state.busqueda_cliente = ""
+                            st.session_state.ultimo_cliente = None
+                            st.rerun()
