@@ -8,7 +8,6 @@ import pandas as pd
 import pytz
 import streamlit as st
 from google.oauth2 import service_account
-from streamlit_geolocation import streamlit_geolocation
 
 # =====================================================================
 # CONFIGURACIÓN
@@ -36,10 +35,11 @@ H_LAT = "Latitud"
 H_LON = "Longitud"
 H_CAJAS_NUM = "N De Caja"
 
-TTL_DATOS = 600          # segundos antes de refrescar desde Google Sheets
+TTL_DATOS = 600          # segundos de validez de los datos en caché
+TTL_FALLA = 60           # reintento rápido tras un fallo
 MIN_CHARS = 3            # mínimo de caracteres para buscar
 MAX_RESULTADOS = 30      # máximo de resultados en el selector
-TIMEOUT_API = (6, 30)    # (conexión, lectura) en segundos
+TIMEOUT_API = (5, 20)    # (conexión, lectura) en segundos
 
 
 def ahora_argentina():
@@ -56,7 +56,7 @@ def normalizar(texto):
 # =====================================================================
 # CONEXIÓN A GOOGLE SHEETS (se crea UNA sola vez por servidor)
 # =====================================================================
-@st.cache_resource(show_spinner="Conectando a Fusión...")
+@st.cache_resource(show_spinner=False)
 def get_doc():
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
@@ -67,7 +67,7 @@ def get_doc():
         ],
     )
     client = gspread.authorize(creds)
-    # Evita que la app quede colgada "cargando" si se corta la red
+    # Evita que la app quede colgada si se corta la red
     try:
         client.set_timeout(TIMEOUT_API)
     except Exception:
@@ -81,17 +81,10 @@ def get_ws_clientes():
 
 
 # =====================================================================
-# DATOS: una sola llamada a la API, compartida entre todos los usuarios
+# CACHÉ EN MEMORIA (compartido entre sesiones del mismo proceso)
 # =====================================================================
-@st.cache_resource(show_spinner=False)
-def get_store():
-    return {
-        "lock": threading.RLock(),
-        "ts": 0.0,
-        "clientes": None,
-        "cajas": [],
-        "headers": [],
-    }
+_LOCK = threading.RLock()
+_CACHE = {"ts": 0.0, "clientes": None, "cajas": [], "headers": []}
 
 
 def _a_df(values):
@@ -103,17 +96,26 @@ def _a_df(values):
     return pd.DataFrame(filas, columns=headers)
 
 
-def _fetch():
+@st.cache_data(ttl=TTL_DATOS, show_spinner=False)
+def _fetch_remote():
+    """Una sola ejecución para TODOS los usuarios dentro del TTL.
+
+    st.cache_data deduplica: si 20 técnicos entran a la vez con la caché
+    vencida, se hace 1 sola llamada a Google y los otros 19 esperan el
+    resultado ya calculado (en vez de 20 llamadas simultáneas que se
+    pelean la cuota y dan timeout).
+    """
     doc = get_doc()
-    resp = None
-    for intento in range(3):
+    resp, err = None, None
+    for _ in range(2):
         try:
             resp = doc.values_batch_get([WORKSHEET_CLIENTES, WORKSHEET_CAJAS])
             break
-        except Exception:
-            if intento == 2:
-                raise
-            time.sleep(1 + intento)
+        except Exception as e:
+            err = e
+            time.sleep(0.7)
+    if resp is None:
+        raise err
 
     rangos = resp.get("valueRanges", [])
     df_clientes = _a_df(rangos[0].get("values", []) if len(rangos) > 0 else [])
@@ -137,29 +139,41 @@ def _fetch():
 
 
 def get_data(force=False):
-    """Devuelve (df_clientes, cajas, headers, aviso). Refresca solo si venció el TTL."""
-    s = get_store()
-    with s["lock"]:
-        vencido = (time.time() - s["ts"]) > TTL_DATOS
-        if force or vencido or s["clientes"] is None:
-            try:
-                df, cajas, headers = _fetch()
-                s["clientes"], s["cajas"], s["headers"] = df, cajas, headers
-                s["ts"] = time.time()
-            except Exception as e:
-                if s["clientes"] is None:
-                    raise
-                # Hay datos viejos: seguimos con ellos y reintentamos en 1 minuto
-                s["ts"] = time.time() - TTL_DATOS + 60
-                return s["clientes"], s["cajas"], s["headers"], f"No pude actualizar la base ({str(e)[:60]}). Uso datos anteriores."
-        return s["clientes"], s["cajas"], s["headers"], None
+    """Devuelve (df_clientes, cajas, headers, aviso).
+
+    Si hay datos guardados, NUNCA se queda colgado: sirve lo que hay y
+    reintenta después. Solo bloquea (pocos segundos) la primera carga real.
+    """
+    with _LOCK:
+        fresco = _CACHE["clientes"] is not None and (time.time() - _CACHE["ts"]) < TTL_DATOS
+        if not force and fresco:
+            return _CACHE["clientes"], _CACHE["cajas"], _CACHE["headers"], None
+
+    if force:
+        _fetch_remote.clear()
+
+    try:
+        df, cajas, headers = _fetch_remote()
+    except Exception as e:
+        with _LOCK:
+            if _CACHE["clientes"] is not None:
+                # Falló la actualización pero tenemos datos viejos: los servimos
+                # y reintentamos dentro de 1 minuto, sin bloquear la pantalla.
+                _CACHE["ts"] = time.time() - TTL_DATOS + TTL_FALLA
+                return _CACHE["clientes"], _CACHE["cajas"], _CACHE["headers"], \
+                    f"No pude actualizar la base ({str(e)[:60]}). Uso datos anteriores."
+        raise
+
+    with _LOCK:
+        _CACHE["clientes"], _CACHE["cajas"], _CACHE["headers"] = df, cajas, headers
+        _CACHE["ts"] = time.time()
+    return df, cajas, headers, None
 
 
 def parchear_fila(row_pos, cambios):
     """Actualiza en memoria la fila guardada, para no recargar toda la hoja."""
-    s = get_store()
-    with s["lock"]:
-        df = s["clientes"]
+    with _LOCK:
+        df = _CACHE["clientes"]
         if df is None or row_pos not in df.index:
             return
         for col, val in cambios.items():
@@ -171,7 +185,7 @@ def parchear_fila(row_pos, cambios):
 # GPS: cada cliente tiene su propio componente (evita coords viejas)
 # =====================================================================
 # La librería fija internamente key="loc", por eso llamamos al componente
-# interno con una clave propia por cliente: así se reinicia solo, sin reruns extra.
+# interno con una clave propia por cliente: así se reinicia solo.
 GEO_DEFAULT = {
     "latitude": None, "longitude": None, "altitude": None, "accuracy": None,
     "altitudeAccuracy": None, "heading": None, "speed": None,
@@ -190,13 +204,31 @@ def widget_gps(id_cliente):
     nonce = st.session_state.get("geo_nonce", 0)
     if _geo_component is not None:
         return _geo_component(key=f"geo_{id_cliente}_{nonce}", default=GEO_DEFAULT)
-    # Plan B (si la librería cambia): remontar el componente con un rerun
-    marca = f"{id_cliente}_{nonce}"
-    if st.session_state.get("geo_marca") != marca:
-        st.session_state.geo_marca = marca
-        st.info("🔄 Preparando GPS para el nuevo cliente...")
-        st.rerun()
-    return streamlit_geolocation()
+
+    # Plan B: si el componente no cargó (algunos navegadores móviles lo
+    # bloquean), se permiten ingresar las coordenadas manualmente.
+    st.info(
+        "⚠️ El GPS automático no está disponible en este navegador. "
+        "Ingresá las coordenadas manualmente (podés copiarlas desde Google Maps: "
+        "mantené presionado el punto en el mapa y tocá las coordenadas que aparecen)."
+    )
+    c1, c2 = st.columns(2)
+    lat_txt = c1.text_input("Latitud", key=f"mlat_{id_cliente}", placeholder="-31.420083")
+    lon_txt = c2.text_input("Longitud", key=f"mlon_{id_cliente}", placeholder="-64.188776")
+    if st.button("📌 Usar estas coordenadas", key=f"mset_{id_cliente}", use_container_width=True):
+        try:
+            lat = float(lat_txt.replace(",", "."))
+            lon = float(lon_txt.replace(",", "."))
+        except ValueError:
+            st.error("Formato inválido. Usá números, con punto o coma decimal.")
+        else:
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                st.session_state[f"loc_manual_{id_cliente}"] = {
+                    "latitude": lat, "longitude": lon, "accuracy": None,
+                }
+            else:
+                st.error("Coordenadas fuera de rango.")
+    return st.session_state.get(f"loc_manual_{id_cliente}")
 
 
 # =====================================================================
@@ -211,10 +243,13 @@ def localizar_fila(ws, headers, numero, fila_esperada):
             return fila_esperada
     except Exception:
         pass
-    valores = ws.col_values(col_num)
-    for i, v in enumerate(valores, start=1):
-        if i > 1 and str(v).strip() == str(numero).strip():
-            return i
+    try:
+        valores = ws.col_values(col_num)
+        for i, v in enumerate(valores, start=1):
+            if i > 1 and str(v).strip() == str(numero).strip():
+                return i
+    except Exception:
+        pass
     return None
 
 
@@ -253,13 +288,15 @@ def guardar(row_pos, numero, loc, nuevo_precinto, precinto_actual, nueva_caja, c
                     cambios[H_CAJA] = nueva_caja
                 parchear_fila(row_pos, cambios)
             else:
-                get_store()["ts"] = 0.0  # la hoja cambió de orden: forzar recarga
+                with _LOCK:
+                    _CACHE["ts"] = 0.0  # la hoja cambió de orden: forzar recarga
+                _fetch_remote.clear()
             return True, None
 
         except Exception as e:
             if intento < 2:
                 get_ws_clientes.clear()
-                time.sleep(1 + intento)
+                time.sleep(0.8)
                 try:
                     ws = get_ws_clientes()
                 except Exception:
@@ -295,7 +332,8 @@ def panel_cliente(row_pos, df_clientes, cajas, headers):
         st.markdown(f"🗺️ **[Ver ubicación actual en Google Maps](https://www.google.com/maps?q={lat_actual},{lon_actual})**")
 
     st.markdown("### 1. 📡 OBTENER UBICACIÓN")
-    st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
+    if _geo_component is not None:
+        st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
 
     loc = widget_gps(id_cliente)
 
@@ -314,7 +352,8 @@ def panel_cliente(row_pos, df_clientes, cajas, headers):
         except (TypeError, ValueError):
             pass
     else:
-        st.error("❌ Esperando captura de GPS... Tocá el botón de arriba.")
+        if _geo_component is not None:
+            st.error("❌ Esperando captura de GPS... Tocá el botón de arriba.")
 
     # Si la caja actual no está en la lista, la agregamos para no borrarla sin querer
     opciones_caja = [""] + cajas
@@ -340,7 +379,7 @@ def panel_cliente(row_pos, df_clientes, cajas, headers):
 
     # ---- Validaciones ----
     if not loc_valida(loc):
-        st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
+        st.error("❌ No podés guardar sin obtener la ubicación primero (botón de GPS o coordenadas manuales).")
         return
     if nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
         st.error("❌ El precinto debe tener exactamente 7 números.")
@@ -371,65 +410,78 @@ def panel_cliente(row_pos, df_clientes, cajas, headers):
 # =====================================================================
 # INTERFAZ
 # =====================================================================
-try:
-    df_clientes, cajas, headers, aviso = get_data()
-except Exception as e:
-    st.error(f"Error de conexión. Contactá a oficina. Detalle: {str(e)[:200]}")
-    if st.button("🔄 Reintentar"):
-        st.rerun()
-    st.stop()
+def main():
+    st.title("📍 Fusión Campo")
+    st.markdown("Captura de coordenadas de Clientes")
+    st.markdown("---")
 
-st.title("📍 Fusión Campo")
-st.markdown("Captura de coordenadas de Clientes")
-st.markdown("---")
+    # El reseteo se hace ANTES de crear el widget (si no, Streamlit da error)
+    if st.session_state.pop("reset_busqueda", False):
+        st.session_state["busqueda_cliente"] = ""
 
-if aviso:
-    st.warning(aviso)
+    mensaje_ok = st.session_state.pop("msg_ok", None)
+    if mensaje_ok:
+        st.success(mensaje_ok)
 
-# El reseteo se hace ANTES de crear el widget (si no, Streamlit da error)
-if st.session_state.pop("reset_busqueda", False):
-    st.session_state["busqueda_cliente"] = ""
+    # La pantalla se dibuja PRIMERO: el técnico ve la app al instante,
+    # aunque los datos todavía estén cargando abajo.
+    busqueda = st.text_input(
+        "🔍 Buscar Cliente (Nombre o Nº)",
+        placeholder="Ej: Juan Perez o 9944",
+        key="busqueda_cliente",
+    ).strip()
 
-mensaje_ok = st.session_state.pop("msg_ok", None)
-if mensaje_ok:
-    st.success(mensaje_ok)
+    # ---- Carga de datos (con caché es casi instantáneo; nunca cuelga la app) ----
+    try:
+        with st.spinner("Cargando datos..."):
+            df_clientes, cajas, headers, aviso = get_data()
+    except Exception as e:
+        st.error(f"Error de conexión con la planilla. Detalle: {str(e)[:200]}")
+        if st.button("🔄 Reintentar"):
+            _fetch_remote.clear()
+            st.rerun()
+        st.stop()
 
-busqueda = st.text_input(
-    "🔍 Buscar Cliente (Nombre o Nº)",
-    placeholder="Ej: Juan Perez o 9944",
-    key="busqueda_cliente",
-).strip()
+    if aviso:
+        st.warning(aviso)
 
-if busqueda:
-    q = normalizar(busqueda)
-    if len(q) < MIN_CHARS:
-        st.caption(f"Escribí al menos {MIN_CHARS} caracteres para buscar.")
-    else:
-        resultados = df_clientes[df_clientes["_buscar"].str.contains(q, regex=False)]
-        total = len(resultados)
+    edad_min = int(time.time() - _CACHE["ts"]) // 60
+    st.caption(f"🕒 Datos actualizados hace {edad_min} min.")
 
-        if total == 0:
-            st.warning("No se encontraron clientes.")
+    # ---- Búsqueda ----
+    if busqueda:
+        q = normalizar(busqueda)
+        if len(q) < MIN_CHARS:
+            st.caption(f"Escribí al menos {MIN_CHARS} caracteres para buscar.")
         else:
-            if total > MAX_RESULTADOS:
-                st.caption(f"Mostrando {MAX_RESULTADOS} de {total} resultados. Escribí más para afinar la búsqueda.")
-                resultados = resultados.head(MAX_RESULTADOS)
+            resultados = df_clientes[df_clientes["_buscar"].str.contains(q, regex=False)]
+            total = len(resultados)
 
-            etiquetas = dict(
-                zip(resultados.index, resultados[H_NUM].astype(str) + " - " + resultados[H_NOMBRE].astype(str))
-            )
-            row_pos = st.selectbox(
-                "Seleccioná el cliente correcto:",
-                options=list(etiquetas.keys()),
-                format_func=lambda i: etiquetas.get(i, str(i)),
-            )
-            panel_cliente(row_pos, df_clientes, cajas, headers)
+            if total == 0:
+                st.warning("No se encontraron clientes.")
+            else:
+                if total > MAX_RESULTADOS:
+                    st.caption(f"Mostrando {MAX_RESULTADOS} de {total} resultados. Escribí más para afinar la búsqueda.")
+                    resultados = resultados.head(MAX_RESULTADOS)
 
-st.markdown("---")
-if st.button("🔄 Recargar datos de la planilla"):
-    with st.spinner("Actualizando..."):
-        try:
-            get_data(force=True)
-        except Exception as e:
-            st.error(f"No pude actualizar: {str(e)[:100]}")
-    st.rerun()
+                etiquetas = dict(
+                    zip(resultados.index, resultados[H_NUM].astype(str) + " - " + resultados[H_NOMBRE].astype(str))
+                )
+                row_pos = st.selectbox(
+                    "Seleccioná el cliente correcto:",
+                    options=list(etiquetas.keys()),
+                    format_func=lambda i: etiquetas.get(i, str(i)),
+                )
+                panel_cliente(row_pos, df_clientes, cajas, headers)
+
+    st.markdown("---")
+    if st.button("🔄 Recargar datos de la planilla"):
+        with st.spinner("Actualizando..."):
+            try:
+                get_data(force=True)
+            except Exception as e:
+                st.error(f"No pude actualizar: {str(e)[:100]}")
+        st.rerun()
+
+
+main()
