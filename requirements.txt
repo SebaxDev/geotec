@@ -1,0 +1,6 @@
+streamlit
+pandas
+google-auth
+gspread
+streamlit-geolocation
+pytz
