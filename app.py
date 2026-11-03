@@ -28,12 +28,22 @@ def get_sheet_client():
     )
     return gspread.authorize(creds)
 
-@st.cache_data(ttl=60, show_spinner="Actualizando base...")
+# OPTIMIZACIÓN 1: Subimos el TTL a 600 (10 minutos)
+@st.cache_data(ttl=600, show_spinner="Actualizando base (optimizado)...")
 def load_data():
     client = get_sheet_client()
     doc = client.open_by_key(SHEET_ID)
-    df_clientes = pd.DataFrame(doc.worksheet(WORKSHEET_CLIENTES).get_all_records(default_blank=""))
-    df_cajas = pd.DataFrame(doc.worksheet(WORKSHEET_CAJAS).get_all_records(default_blank=""))
+    
+    # OPTIMIZACIÓN 2: Usar get_all_values() en lugar de get_all_records()
+    ws_clientes = doc.worksheet(WORKSHEET_CLIENTES)
+    data_clientes = ws_clientes.get_all_values()
+    # Convertimos la lista cruda en un DataFrame usando la primera fila como columnas
+    df_clientes = pd.DataFrame(data_clientes[1:], columns=data_clientes[0])
+    
+    ws_cajas = doc.worksheet(WORKSHEET_CAJAS)
+    data_cajas = ws_cajas.get_all_values()
+    df_cajas = pd.DataFrame(data_cajas[1:], columns=data_cajas[0])
+    
     return df_clientes, df_cajas
 
 try:
@@ -45,7 +55,7 @@ except Exception as e:
     st.stop()
 
 # --- INTERFAZ MÓVIL ---
-st.title("📍 Fusión Geo")
+st.title("📍 Fusión Campo")
 st.markdown("Captura de coordenadas de Clientes")
 st.markdown("---")
 
@@ -85,7 +95,6 @@ if busqueda:
         st.info(f"**Dirección:** {cliente_row.get('Dirección', 'S/D')} \n\n"
                 f"**Caja actual:** {caja_actual if caja_actual else 'Ninguna'} | **Precinto:** {cliente_row.get('N° de Precinto', 'Ninguno')}")
         
-        # --- MEJORA 1: AVISO DE UBICACIÓN PREVIA Y ENLACE A MAPS ---
         lat_actual = str(cliente_row.get("Latitud", "")).strip()
         lon_actual = str(cliente_row.get("Longitud", "")).strip()
         
@@ -93,24 +102,20 @@ if busqueda:
             st.warning(f"⚠️ **Atención:** Este cliente ya tiene una ubicación guardada ({lat_actual}, {lon_actual}). Si guardás ahora, la ubicación anterior será reemplazada.")
             st.markdown(f"🗺️ **[Ver ubicación actual en Google Maps](https://www.google.com/maps?q={lat_actual},{lon_actual})**")
         
-        # --- TRUCO DE REINICIO PARA EL BOTÓN GPS ---
         if "ultimo_cliente" not in st.session_state:
             st.session_state.ultimo_cliente = id_cliente
             st.session_state.refresh_gps = False
 
         if st.session_state.ultimo_cliente != id_cliente:
-            # Cambió el cliente, forzamos un reinicio de memoria
             st.session_state.ultimo_cliente = id_cliente
             st.session_state.refresh_gps = True
             st.rerun()
 
         if st.session_state.refresh_gps:
-            # En esta pasada NO dibujamos el GPS, así Streamlit lo borra
             st.session_state.refresh_gps = False
             st.info("🔄 Preparando satélite para el nuevo cliente...")
             st.rerun()
         else:
-            # Dibujamos el GPS en limpio (sin usar "key" para evitar el TypeError)
             st.markdown("### 1. 📡 OBTENER UBICACIÓN")
             st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
             
@@ -134,7 +139,6 @@ if busqueda:
                 submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
                 
                 if submit:
-                    # --- MEJORA 2: CONTROL DE PRECINTOS DUPLICADOS ---
                     duplicado = False
                     if nuevo_precinto and nuevo_precinto != precinto_actual and len(nuevo_precinto) == 7:
                         duplicados_df = df_clientes[df_clientes["N° de Precinto"].astype(str).str.strip() == nuevo_precinto]
@@ -158,7 +162,6 @@ if busqueda:
                         if nueva_caja != caja_actual:
                             updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
                             
-                        # --- MEJORA 3: TOLERANCIA A MICROCORTES (REINTENTOS) ---
                         guardado_exitoso = False
                         max_intentos = 3
                         
@@ -169,7 +172,7 @@ if busqueda:
                                 break
                             except Exception as e:
                                 if intento < max_intentos - 1:
-                                    time.sleep(2)  # Espera 2 segundos si hay un microcorte 4G
+                                    time.sleep(2)
                                 else:
                                     st.error(f"❌ Error de red al guardar: {str(e)[:50]}... Intentá nuevamente.")
                         
@@ -177,7 +180,6 @@ if busqueda:
                             st.cache_data.clear()
                             st.success("✅ Datos guardados correctamente. Actualizando pantalla...")
                             
-                            # --- MEJORA 4: REINICIO AUTOMÁTICO DE INTERFAZ ---
                             time.sleep(1.5)
                             st.session_state.busqueda_cliente = ""
                             st.session_state.ultimo_cliente = None
