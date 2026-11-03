@@ -67,7 +67,7 @@ if busqueda:
         idx_sel = opciones.index(cliente_sel)
         cliente_row = resultados.iloc[idx_sel]
         
-        # Obtenemos un ID único para reiniciar el estado del botón GPS en cada cliente
+        # ID para controlar el reseteo
         id_cliente = str(cliente_row.get('Nº Cliente', idx_sel))
         row_idx = cliente_row.name + 2 
         
@@ -83,46 +83,62 @@ if busqueda:
         if lat_actual and lon_actual and lat_actual not in ["nan", "None", ""] and lon_actual not in ["nan", "None", ""]:
             st.warning(f"⚠️ **Atención:** Este cliente ya tiene una ubicación guardada ({lat_actual}, {lon_actual}). Si guardás ahora, la ubicación anterior será reemplazada.")
         
-        # --- MEJORA 2 y 3: BOTÓN DE GPS Y RESETEO ---
-        st.markdown("### 1. 📡 OBTENER UBICACIÓN")
-        st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
-        
-        # El key dinámico asegura que se borre el cartel verde al buscar un nuevo cliente
-        loc = streamlit_geolocation(key=f"gps_{id_cliente}")
-        
-        if loc and 'latitude' in loc and loc['latitude'] is not None:
-            st.success(f"📍 ¡Ubicación capturada lista para guardar!\n\nLat: {loc['latitude']} | Lon: {loc['longitude']}")
+        # --- TRUCO DE REINICIO PARA EL BOTÓN GPS ---
+        if "ultimo_cliente" not in st.session_state:
+            st.session_state.ultimo_cliente = id_cliente
+            st.session_state.refresh_gps = False
+
+        if st.session_state.ultimo_cliente != id_cliente:
+            # Cambió el cliente, forzamos un reinicio de memoria
+            st.session_state.ultimo_cliente = id_cliente
+            st.session_state.refresh_gps = True
+            st.rerun()
+
+        if st.session_state.refresh_gps:
+            # En esta pasada NO dibujamos el GPS, así Streamlit lo borra
+            st.session_state.refresh_gps = False
+            st.info("🔄 Preparando satélite para el nuevo cliente...")
+            st.rerun()
         else:
-            st.error("❌ Esperando captura de GPS... Toca el botón de arriba.")
-        
-        with st.form(key=f"form_{id_cliente}"):
-            st.markdown("### 2. Datos Complementarios (Opcional)")
+            # Dibujamos el GPS en limpio (sin usar "key" para evitar el TypeError)
+            st.markdown("### 1. 📡 OBTENER UBICACIÓN")
+            st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
             
-            cajas_validas = [""] + sorted([str(c).strip() for c in df_cajas["N De Caja"].dropna().unique() if str(c).strip()])
-            caja_idx = cajas_validas.index(caja_actual) if caja_actual in cajas_validas else 0
+            loc = streamlit_geolocation() 
             
-            precinto_actual = str(cliente_row.get("N° de Precinto", "")).replace("nan", "")
-            nuevo_precinto = st.text_input("🔒 Precinto (Solo 7 números)", value=precinto_actual)
-            nueva_caja = st.selectbox("📦 Caja NAP", options=cajas_validas, index=caja_idx)
+            if loc and 'latitude' in loc and loc['latitude'] is not None:
+                st.success(f"📍 ¡Ubicación capturada lista para guardar!\n\nLat: {loc['latitude']} | Lon: {loc['longitude']}")
+            else:
+                st.error("❌ Esperando captura de GPS... Toca el botón de arriba.")
             
-            submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
-            
-            if submit:
-                if not loc or 'latitude' not in loc or loc['latitude'] is None:
-                    st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
-                elif nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
-                    st.error("❌ El precinto debe tener exactamente 7 números.")
-                else:
-                    updates = [
-                        {"range": f"J{row_idx}", "values": [[str(loc['latitude'])]]},
-                        {"range": f"K{row_idx}", "values": [[str(loc['longitude'])]]},
-                        {"range": f"H{row_idx}", "values": [[ahora_argentina()]]}
-                    ]
-                    if nuevo_precinto != precinto_actual:
-                        updates.append({"range": f"F{row_idx}", "values": [[nuevo_precinto]]})
-                    if nueva_caja != caja_actual:
-                        updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
-                        
-                    ws_clientes.batch_update(updates, value_input_option='USER_ENTERED')
-                    st.cache_data.clear()
-                    st.success("✅ Datos guardados correctamente.")
+            with st.form(key=f"form_{id_cliente}"):
+                st.markdown("### 2. Datos Complementarios (Opcional)")
+                
+                cajas_validas = [""] + sorted([str(c).strip() for c in df_cajas["N De Caja"].dropna().unique() if str(c).strip()])
+                caja_idx = cajas_validas.index(caja_actual) if caja_actual in cajas_validas else 0
+                
+                precinto_actual = str(cliente_row.get("N° de Precinto", "")).replace("nan", "")
+                nuevo_precinto = st.text_input("🔒 Precinto (Solo 7 números)", value=precinto_actual)
+                nueva_caja = st.selectbox("📦 Caja NAP", options=cajas_validas, index=caja_idx)
+                
+                submit = st.form_submit_button("💾 Guardar Datos", use_container_width=True)
+                
+                if submit:
+                    if not loc or 'latitude' not in loc or loc['latitude'] is None:
+                        st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
+                    elif nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
+                        st.error("❌ El precinto debe tener exactamente 7 números.")
+                    else:
+                        updates = [
+                            {"range": f"J{row_idx}", "values": [[str(loc['latitude'])]]},
+                            {"range": f"K{row_idx}", "values": [[str(loc['longitude'])]]},
+                            {"range": f"H{row_idx}", "values": [[ahora_argentina()]]}
+                        ]
+                        if nuevo_precinto != precinto_actual:
+                            updates.append({"range": f"F{row_idx}", "values": [[nuevo_precinto]]})
+                        if nueva_caja != caja_actual:
+                            updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
+                            
+                        ws_clientes.batch_update(updates, value_input_option='USER_ENTERED')
+                        st.cache_data.clear()
+                        st.success("✅ Datos guardados correctamente.")
