@@ -27,7 +27,6 @@ def get_sheet_client():
     )
     return gspread.authorize(creds)
 
-# Solo devolvemos DataFrames, NUNCA el objeto de conexión de la hoja
 @st.cache_data(ttl=60, show_spinner="Actualizando base...")
 def load_data():
     client = get_sheet_client()
@@ -37,10 +36,7 @@ def load_data():
     return df_clientes, df_cajas
 
 try:
-    # 1. Cargamos la vista de datos cacheados
     df_clientes, df_cajas = load_data()
-    
-    # 2. Obtenemos una sesión activa y viva para poder escribir
     client = get_sheet_client()
     ws_clientes = client.open_by_key(SHEET_ID).worksheet(WORKSHEET_CLIENTES)
 except Exception as e:
@@ -71,7 +67,8 @@ if busqueda:
         idx_sel = opciones.index(cliente_sel)
         cliente_row = resultados.iloc[idx_sel]
         
-        # gspread usa índice base 1, +1 por el header = +2
+        # Obtenemos un ID único para reiniciar el estado del botón GPS en cada cliente
+        id_cliente = str(cliente_row.get('Nº Cliente', idx_sel))
         row_idx = cliente_row.name + 2 
         
         caja_actual = str(cliente_row.get("Caja NAP", "")).replace("nan", "")
@@ -79,17 +76,26 @@ if busqueda:
         st.info(f"**Dirección:** {cliente_row.get('Dirección', 'S/D')} \n\n"
                 f"**Caja actual:** {caja_actual if caja_actual else 'Ninguna'} | **Precinto:** {cliente_row.get('N° de Precinto', 'Ninguno')}")
         
-        st.markdown("### 1. Capturar Satélite")
-        loc = streamlit_geolocation()
+        # --- MEJORA 1: AVISO DE UBICACIÓN PREVIA ---
+        lat_actual = str(cliente_row.get("Latitud", "")).strip()
+        lon_actual = str(cliente_row.get("Longitud", "")).strip()
         
-        # --- VISTA PREVIA CLIENTE ---
+        if lat_actual and lon_actual and lat_actual not in ["nan", "None", ""] and lon_actual not in ["nan", "None", ""]:
+            st.warning(f"⚠️ **Atención:** Este cliente ya tiene una ubicación guardada ({lat_actual}, {lon_actual}). Si guardás ahora, la ubicación anterior será reemplazada.")
+        
+        # --- MEJORA 2 y 3: BOTÓN DE GPS Y RESETEO ---
+        st.markdown("### 1. 📡 OBTENER UBICACIÓN")
+        st.markdown("**Presioná el botón debajo para leer el GPS de tu celular ⬇️**")
+        
+        # El key dinámico asegura que se borre el cartel verde al buscar un nuevo cliente
+        loc = streamlit_geolocation(key=f"gps_{id_cliente}")
+        
         if loc and 'latitude' in loc and loc['latitude'] is not None:
-            st.success(f"📍 Coordenadas obtenidas: {loc['latitude']}, {loc['longitude']}")
+            st.success(f"📍 ¡Ubicación capturada lista para guardar!\n\nLat: {loc['latitude']} | Lon: {loc['longitude']}")
         else:
-            st.warning("Esperando captura de GPS... Presioná el botón arriba.")
-        # ----------------------------
+            st.error("❌ Esperando captura de GPS... Toca el botón de arriba.")
         
-        with st.form("form_cliente"):
+        with st.form(key=f"form_{id_cliente}"):
             st.markdown("### 2. Datos Complementarios (Opcional)")
             
             cajas_validas = [""] + sorted([str(c).strip() for c in df_cajas["N De Caja"].dropna().unique() if str(c).strip()])
@@ -103,7 +109,7 @@ if busqueda:
             
             if submit:
                 if not loc or 'latitude' not in loc or loc['latitude'] is None:
-                    st.error("❌ Presioná el botón de ubicación primero.")
+                    st.error("❌ No podés guardar sin presionar el botón de ubicación primero.")
                 elif nuevo_precinto and (not nuevo_precinto.isdigit() or len(nuevo_precinto) != 7):
                     st.error("❌ El precinto debe tener exactamente 7 números.")
                 else:
