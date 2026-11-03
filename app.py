@@ -19,28 +19,32 @@ def ahora_argentina():
 
 # --- CONEXIÓN A SHEETS ---
 @st.cache_resource(show_spinner="Conectando a Fusión...")
-def init_connection():
+def get_sheet_client():
+    creds_dict = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
+        creds_dict,
         scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     )
-    client = gspread.authorize(creds)
-    return client.open_by_key(SHEET_ID)
+    return gspread.authorize(creds)
 
+# Solo devolvemos DataFrames, NUNCA el objeto de conexión de la hoja
 @st.cache_data(ttl=60, show_spinner="Actualizando base...")
 def load_data():
-    doc = init_connection()
-    ws_clientes = doc.worksheet(WORKSHEET_CLIENTES)
-    ws_cajas = doc.worksheet(WORKSHEET_CAJAS)
-    
-    df_clientes = pd.DataFrame(ws_clientes.get_all_records(default_blank=""))
-    df_cajas = pd.DataFrame(ws_cajas.get_all_records(default_blank=""))
-    return ws_clientes, df_clientes, df_cajas
+    client = get_sheet_client()
+    doc = client.open_by_key(SHEET_ID)
+    df_clientes = pd.DataFrame(doc.worksheet(WORKSHEET_CLIENTES).get_all_records(default_blank=""))
+    df_cajas = pd.DataFrame(doc.worksheet(WORKSHEET_CAJAS).get_all_records(default_blank=""))
+    return df_clientes, df_cajas
 
 try:
-    ws_clientes, df_clientes, df_cajas = load_data()
+    # 1. Cargamos la vista de datos cacheados
+    df_clientes, df_cajas = load_data()
+    
+    # 2. Obtenemos una sesión activa y viva para poder escribir
+    client = get_sheet_client()
+    ws_clientes = client.open_by_key(SHEET_ID).worksheet(WORKSHEET_CLIENTES)
 except Exception as e:
-    st.error("Error de conexión. Contactá a oficina.")
+    st.error(f"Error de conexión. Contactá a oficina. Detalle: {e}")
     st.stop()
 
 # --- INTERFAZ MÓVIL ---
@@ -113,6 +117,6 @@ if busqueda:
                     if nueva_caja != caja_actual:
                         updates.append({"range": f"M{row_idx}", "values": [[nueva_caja]]})
                         
-                    ws_clientes.batch_update(updates)
+                    ws_clientes.batch_update(updates, value_input_option='USER_ENTERED')
                     st.cache_data.clear()
                     st.success("✅ Datos guardados correctamente.")
