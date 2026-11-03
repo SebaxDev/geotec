@@ -45,7 +45,7 @@ except Exception as e:
     st.stop()
 
 # --- INTERFAZ MÓVIL ---
-st.title("📍 Fusión Campo")
+st.title("📍 Fusión Geo")
 st.markdown("Captura de coordenadas de Clientes")
 st.markdown("---")
 
